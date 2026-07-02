@@ -1,0 +1,8 @@
+# Ignore the virtual environment
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Ignore environment variables containing your secret keys
+.env
