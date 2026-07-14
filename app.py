@@ -1,92 +1,121 @@
-import os
 import streamlit as st
-from dotenv import load_dotenv
+import numpy as np
 from google import genai
 from google.genai import types
-from pydantic import BaseModel, Field
-from typing import List
+from dotenv import load_dotenv
 
-# Load environment variables
+# Load API Key
 load_dotenv()
 
-# Initialize the Gemini client
+st.set_page_config(page_title="VectorMind RAG Chatbot", page_icon="📚", layout="wide")
+
+# App Layout Titles
+st.title("📚 VectorMind RAG Chatbot")
+st.caption("Powered by Gemini Embeddings, In-Memory Vector Search, and Gemini 2.5 Flash")
+
+# Initialize Gemini Client
 client = genai.Client()
 
-# Pydantic Blueprint for structured data
-class ResearchData(BaseModel):
-    topic: str = Field(description="The main topic of research.")
-    key_facts: List[str] = Field(description="A list of 3 distinct, high-quality facts about the topic.")
-    source_type: str = Field(description="The general source classification, e.g., 'Technical Docs'.")
+# Helper Function: Split document into chunks
+def chunk_text(text, chunk_size=600, overlap=100):
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunks.append(text[start:end])
+        start += (chunk_size - overlap)
+    return chunks
 
-# --- AGENT 1: The Researcher ---
-def researcher_agent(user_topic: str) -> ResearchData:
-    prompt = f"Perform high-level research on the following topic and extract key facts: {user_topic}"
-    response = client.models.generate_content(
-        model='gemini-2.5-flash',
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=ResearchData,
-            temperature=0.2
-        ),
+# Helper Function: Generate embeddings using Gemini
+def get_embedding(text_to_embed, is_query=False):
+    task = "RETRIEVAL_QUERY" if is_query else "RETRIEVAL_DOCUMENT"
+    response = client.models.embed_content(
+        model="gemini-embedding-001",  # <-- Changed this string
+        contents=text_to_embed,
+        config=types.EmbedContentConfig(task_type=task)
     )
-    return ResearchData.model_validate_json(response.text)
+    # Extract the vector list from the response object
+    return response.embeddings[0].values
 
-# --- AGENT 2: The Writer ---
-def writer_agent(data: ResearchData) -> str:
-    prompt = f"""
-    You are an expert technical documentation writer. Take the following structured research data and compile it into a beautifully formatted Markdown report.
-    Use clear headings, bold text, and professional bullet points. Do not mention that you are an AI.
+# Helper Function: Cosine Similarity calculation
+def cosine_similarity(v1, v2):
+    dot_product = np.dot(v1, v2)
+    norm_v1 = np.linalg.norm(v1)
+    norm_v2 = np.linalg.norm(v2)
+    return dot_product / (norm_v1 * norm_v2) if (norm_v1 and norm_v2) else 0.0
+
+# --- SIDEBAR: Document Upload & Knowledge Base Processing ---
+with st.sidebar:
+    st.header("📁 Knowledge Base Setup")
+    uploaded_file = st.file_uploader("Upload a text document (.txt)", type=["txt"])
     
-    Research Data:
-    - Topic: {data.topic}
-    - Source Category: {data.source_type}
-    - Key Facts: {", ".join(data.key_facts)}
-    """
-    response = client.models.generate_content(
-        model='gemini-2.5-flash',
-        contents=prompt,
-        config=types.GenerateContentConfig(temperature=0.7)
-    )
-    return response.text
-
-# --- STREAMLIT WEB UI ---
-st.set_page_config(page_title="AI Multi-Agent Researcher", page_icon="🤖", layout="centered")
-
-st.title("🤖 GenAI Multi-Agent Research Platform")
-st.caption("Built with Python, Google Gemini 2.5, and Pydantic")
-st.write("Enter any topic below. Two specialized AI agents will collaborate sequentially to research and write a professional report.")
-
-# User Input Text Box
-user_topic = st.text_input("Enter Research Topic:", placeholder="e.g., Quantum Computing, Blockchain, Docker...")
-
-# Run Button
-if st.button("Generate Report", type="primary"):
-    if user_topic.strip() == "":
-        st.warning("Please enter a valid topic first!")
-    else:
-        # Step 1: Agent 1 Logic with loading spinner
-        with st.spinner("🕵️ Agent 1 (Researcher) is analyzing and validating facts..."):
-            try:
-                structured_facts = researcher_agent(user_topic)
+    if uploaded_file is not None:
+        raw_text = uploaded_file.read().decode("utf-8")
+        
+        # Avoid re-processing if the file hasn't changed
+        if "file_name" not in st.session_state or st.session_state.file_name != uploaded_file.name:
+            with st.spinner("Processing document & generating vector embeddings..."):
+                chunks = chunk_text(raw_text)
+                embeddings = [get_embedding(chunk, is_query=False) for chunk in chunks]
                 
-                # Show the intermediate step in an expandable box
-                with st.expander("✅ View Agent 1's Structured JSON"):
-                    st.json(structured_facts.model_dump())
-                    
-            except Exception as e:
-                st.error(f"Agent 1 failed: {e}")
-                st.stop()
+                # Store in session state (Our localized Vector Database)
+                st.session_state.kb_chunks = chunks
+                st.session_state.kb_vectors = embeddings
+                st.session_state.file_name = uploaded_file.name
+            st.success(f"Successfully indexed {len(chunks)} text chunks!")
+    else:
+        st.info("Please upload a document to enable the context-aware RAG pipeline.")
 
-        # Step 2: Agent 2 Logic with loading spinner
-        with st.spinner("✍️ Agent 2 (Writer) is compiling the markdown report..."):
-            try:
-                final_report = writer_agent(structured_facts)
-            except Exception as e:
-                st.error(f"Agent 2 failed: {e}")
-                st.stop()
+# --- MAIN CHAT INTERFACE ---
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 
-        # Success message and final output rendering
-        st.success("✨ Report Generation Complete!")
-        st.markdown("---")
-        st.markdown(final_report)
+# Display message history
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+# User Input
+if prompt := st.chat_input("Ask a question about your document..."):
+    with st.chat_message("user"):
+        st.markdown(prompt)
+    st.session_state.messages.append({"role": "user", "content": prompt})
+
+    # Default context if no file is uploaded
+    context = "No document provided by the user."
+    
+    # RAG Pipeline Logic: Retrieve relevant chunks if Knowledge Base exists
+    if "kb_vectors" in st.session_state and len(st.session_state.kb_vectors) > 0:
+        with st.spinner("Searching vector space for answers..."):
+            query_vector = get_embedding(prompt, is_query=True)
+            
+            # Compute similarity scores between query and all stored document chunks
+            scores = [cosine_similarity(query_vector, doc_vec) for doc_vec in st.session_state.kb_vectors]
+            
+            # Extract the top 2 most matching text chunks
+            top_indices = np.argsort(scores)[-2:][::-1]
+            retrieved_chunks = [st.session_state.kb_chunks[idx] for idx in top_indices]
+            context = "\n\n".join(retrieved_chunks)
+
+    # System instruction template forcing the LLM to ground its answers
+    system_prompt = f"""
+    You are an expert, precision-focused enterprise RAG assistant. Your job is to answer the user's question using ONLY the provided context snippets below. 
+    If the answer cannot be confidently derived from the context, state exactly: "I cannot find the answer within the provided document." Do not hallucinate or use external knowledge.
+
+    CONTEXT SNIPPETS:
+    {context}
+    """
+
+    # Generate response from Gemini
+    with st.chat_message("assistant"):
+        try:
+            response = client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=[system_prompt, f"User Question: {prompt}"]
+            )
+            answer = response.text
+        except Exception as e:
+            answer = f"Error generating AI response: {e}"
+            
+        st.markdown(answer)
+    st.session_state.messages.append({"role": "assistant", "content": answer})
